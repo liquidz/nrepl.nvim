@@ -1,37 +1,47 @@
 import neovim
 import nrepl
-import pprint
+import time
+import uuid
+from pprint import pformat
+
+import re
+
+msleep = lambda x: time.sleep(x/1000.0)
 
 @neovim.plugin
 class NreplNvim(object):
     def __init__(self, vim):
         self.__vim = vim
-        self.__conn = False
+        self.__conn = None
+        self.__wc = None
 
     def __echo(self, data):
-        self.__vim.command("echo '[nrepl] {}'".format(pprint.pformat(data).replace("'", "\"")))
+        self.__vim.command("echo '[nrepl] {}'".format(pformat(data).replace("'", "\"")))
 
-    def __run(self, operation):
-        result = []
-        if self.__conn == False and self.__auto_connect() == False:
-            self.__echo('not connected')
-            return result
+    def __run(self, operation, callback, timeout = 500):
+        if self.__conn == None and self.__auto_connect() == False:
+            return
 
-        try:
-            self.__conn.write(operation)
-        except BrokenPipeError:
-            self.__conn = False
-            return self.__run(operation)
+        msgid = uuid.uuid4().hex
 
-        while True:
-            resp = self.__conn.read()
-            result.append(resp)
-            if "status" in resp and resp['status'][0] == 'done':
-                return result
+        done = False
+        def run_callback(msg, wc, key):
+            nonlocal done, callback
+            done = callback(msg, wc, key)
+
+        self.__wc.watch(msgid, {'id': msgid}, run_callback)
+        operation['id'] = msgid
+        self.__wc.send(operation)
+        for _ in range(timeout):
+            if done:
+                break
+            msleep(1)
+        self.__wc.unwatch(msgid)
 
     def __auto_connect(self):
         port_file = self.__vim.eval("findfile('.nrepl-port', '.;')")
         if port_file == '':
+            self.__echo('.nrepl-port is not found')
             return False
         port = open(port_file).read()
         return self.nrepl_connect([port])
@@ -40,16 +50,49 @@ class NreplNvim(object):
     def nrepl_connect(self, port):
         try:
             self.__conn = nrepl.connect("nrepl://localhost:{}".format(port[0]))
+            self.__wc = nrepl.WatchableConnection(self.__conn)
         except ConnectionRefusedError:
             self.__echo('failed to connect %s' % port)
-            self.__conn = False
+            self.__conn = None
+            self.__wc = None
         return self.__conn
+
+    def get_ns_name(self):
+        fl = self.__vim.current.buffer[0]
+        m = re.search('ns\s([^\s)]+)', fl)
+        if m != None:
+            return m.group(1)
+        return None
+
+    @neovim.autocmd("BufEnter", pattern="*.clj")
+    def nrepl_bufenter(self):
+        if self.__conn == None:
+            return
+        fl = self.__vim.current.buffer[0]
+        m = re.search('ns\s([^\s)]+)', fl)
+        if m != None:
+            ns = m.group(1)
+            self.nrepl_eval(["(require '{} :reload-all)".format(ns)])
+            self.nrepl_eval(["(in-ns '{})".format(ns)])
 
     @neovim.function("NreplEval", sync=True)
     def nrepl_eval(self, args):
-        return self.__run({'op': 'eval', 'code': args[0]})
+        out = ''
+        value = None
+        def eval_callback(msg, wc, key):
+            nonlocal out, value
+            if 'out' in msg:
+                out = out + msg['out']
+            elif 'value' in msg:
+                value = msg['value']
+            elif 'status' in msg and msg['status'][0] == 'done':
+                return True
+            return False
 
-    # TODO
+        self.__run({'op': 'eval', 'code': args[0]}, eval_callback)
+        return {'out': out, 'value': value}
+
+    # TODO {{{
     #@neovim.function("NreplClone", sync=True)
     #def _clone(self, args):
     #    return True
@@ -76,3 +119,4 @@ class NreplNvim(object):
     #def completion(self, alias):
     #    op = {"op": "eval", "code": "(map first (ns-publics (get (ns-aliases *ns*) '%s)))" % alias}
     #    return self.run(op)
+    # }}}
